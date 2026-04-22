@@ -9,8 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
-# Pytest ADK SQLite file (see tests/conftest.py)
-tests/.test_adk.sqlite
+# Pytest ADK SQLite file (see core/tests/conftest.py)
+**/.test_adk.sqlite
 
 .env
 !.env.dist
