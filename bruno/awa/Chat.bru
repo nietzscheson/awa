@@ -1,0 +1,33 @@
+meta {
+  name: Chat
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/chat
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "user_id": "{{userId}}",
+    "session_id": "{{sessionId}}",
+    "new_message": {
+      "parts": [
+        {
+          "text": "Im Cristian"
+        }
+      ]
+    }
+  }
+}
+
+docs {
+  Reuses `sessionId` and `userId` from the last **Create Session** request (run that first).
+}

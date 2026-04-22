@@ -1,0 +1,33 @@
+repos:
+  - repo: local
+    hooks:
+      - id: isort
+        name: isort (uv)
+        entry: uv run isort
+        language: system
+        types: [python]
+        pass_filenames: true
+        args: [--settings-path=pyproject.toml]
+
+  - repo: https://github.com/hadialqattan/pycln
+    rev: v2.6.0
+    hooks:
+      - id: pycln
+        args: [--config=pyproject.toml, --all]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.11
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: test
+        name: Run tests
+        entry: uv run pytest -x
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]

@@ -1,0 +1,7 @@
+{
+  "version": "1",
+  "name": "awa",
+  "type": "collection",
+  "ignore": ["node_modules", ".git"],
+  "defaultEnv": "local"
+}
