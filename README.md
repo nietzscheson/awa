@@ -1,6 +1,6 @@
 # Awa
 
-**Awa** is a small FastAPI service that exposes a [Google Agent Development Kit (ADK)](https://google.github.io/adk-docs/) assistant over HTTP: create ADK-backed sessions in Postgres, then send chat turns through a Gemini model. The codebase is intentionally compact (see [`AGENTS.md`](./AGENTS.md) for layout and conventions).
+**Awa** is a small FastAPI service that exposes a [Google Agent Development Kit (ADK)](https://google.github.io/adk-docs/) assistant over HTTP: create ADK-backed sessions in Postgres, then send chat turns through a Gemini model. A structured interview flow runs inside the same **`POST /sessions`** and **`POST /chat`** surface: the agent calls LangGraph-backed tools, using the same `session_id` as the HTTP requests. The codebase is intentionally compact (see [`AGENTS.md`](./AGENTS.md) for layout and conventions).
 
 ## Development environment
 

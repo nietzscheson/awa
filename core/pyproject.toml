@@ -13,6 +13,7 @@ dependencies = [
     "psycopg[binary]>=3.3.3",
     "pydantic-settings>=2.14.0",
     "uvicorn>=0.45.0",
+    "langgraph>=1.1.9",
 ]
 
 [dependency-groups]
@@ -27,6 +28,7 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 filterwarnings = [

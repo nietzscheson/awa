@@ -10,19 +10,19 @@ post {
   auth: none
 }
 
+headers {
+  Content-Type: application/json
+}
+
 body:json {
   {
     "session_id": "{{sessionId}}",
     "user_id": "{{userId}}",
     "language": "es-MX",
     "metadata": {
-      "source": "bruno"
+      "user_name": "Emmanuel"
     }
   }
-}
-
-headers {
-  Content-Type: application/json
 }
 
 script:pre-request {

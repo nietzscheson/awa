@@ -1,0 +1,33 @@
+version: '3'
+
+tasks:
+  test:
+    cmds:
+      - task: test.core
+  test.core:
+    cmds:
+      - uv run python -m pytest -x
+    dir: ./core
+  dependencies:
+    cmds:
+      - uv sync
+    dir: ./core
+  docker.up:
+    dir: "{{.USER_WORKING_DIR}}"
+    preconditions:
+      - test -f compose.yaml
+    cmds:
+      - docker compose up -d
+
+  isort:
+    cmds:
+      - uv run isort
+    dir: ./core
+  pycln:
+    cmds:
+      - uv run pycln
+    dir: ./core
+  ruff:
+    cmds:
+      - uv run ruff
+    dir: ./core
