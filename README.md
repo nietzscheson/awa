@@ -122,3 +122,4 @@ Many clients cannot use `http://0.0.0.0:8080` as a request URL; switch the Bruno
 **Pytest import / settings issues**
 
 `tests/conftest.py` sets `DATABASE_URL` to SQLite **before** importing `src.main` so `Settings` matches the test database; do not import `src.main` earlier in test modules without the same guard.
+# awa
