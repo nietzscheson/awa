@@ -1,0 +1,381 @@
+:root {
+  color-scheme: dark;
+  --bg: #0c0f14;
+  --panel: #151a22;
+  --border: #2a3344;
+  --text: #e8ecf2;
+  --muted: #8b97ab;
+  --accent: #5b8cff;
+  --accent-dim: #3d5a99;
+  --danger: #ff6b6b;
+  --radius: 12px;
+  font-family:
+    "Inter",
+    system-ui,
+    -apple-system,
+    sans-serif;
+  line-height: 1.5;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: radial-gradient(1200px 800px at 20% 0%, #1a2233 0%, var(--bg) 55%);
+  color: var(--text);
+}
+
+.app-shell {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding: 2rem clamp(1rem, 3vw, 2.5rem) 3rem;
+}
+
+.voice-shell {
+  display: grid;
+  grid-template-columns: minmax(200px, 240px) 1fr;
+  gap: 1.25rem;
+  align-items: stretch;
+}
+
+@media (max-width: 720px) {
+  .voice-shell {
+    grid-template-columns: 1fr;
+  }
+}
+
+.session-sidebar {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.85rem 0.75rem;
+  min-height: 200px;
+  max-height: min(70vh, 620px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.session-sidebar__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+}
+
+.session-sidebar__label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.session-sidebar__new {
+  font-size: 0.78rem;
+  padding: 0.35rem 0.55rem;
+}
+
+.session-sidebar__hint {
+  margin: 0 0 0.65rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+  line-height: 1.35;
+}
+
+.session-sidebar__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.session-sidebar__item {
+  width: 100%;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.15rem;
+  padding: 0.5rem 0.55rem;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: #1a2029;
+  color: var(--text);
+}
+
+.session-sidebar__item:hover:not(:disabled) {
+  border-color: #3a4a62;
+  background: #1e2633;
+}
+
+.session-sidebar__item:disabled {
+  opacity: 0.5;
+}
+
+.session-sidebar__item--picked {
+  border-color: var(--accent-dim);
+  box-shadow: 0 0 0 1px #5b8cff33 inset;
+}
+
+.session-sidebar__item--active {
+  border-color: #ff6b6b55;
+}
+
+.session-sidebar__id {
+  font-size: 0.8rem;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.session-sidebar__when {
+  font-size: 0.68rem;
+  color: var(--muted);
+}
+
+.app-header h1 {
+  margin: 0;
+  font-size: 1.75rem;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.voice-chat {
+  margin-top: 2rem;
+  display: flex;
+  flex-direction: column;
+  max-height: min(70vh, 620px);
+  min-height: 280px;
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.voice-chat__header {
+  flex-shrink: 0;
+  padding: 1rem 1.25rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  z-index: 1;
+}
+
+.status-line {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-bottom: 0.75rem;
+  min-height: 1.25rem;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  margin-bottom: 0;
+}
+
+.actions--with-meter {
+  align-items: center;
+}
+
+.voice-meter {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: 32px;
+  padding: 0 0.35rem;
+}
+
+.voice-meter__bar {
+  display: block;
+  width: 5px;
+  height: 28px;
+  border-radius: 3px;
+  background: linear-gradient(180deg, #7aa8ff 0%, #4b6fcb 55%, #2d4a8f 100%);
+  transform-origin: bottom;
+  animation: voice-meter-bar 0.75s ease-in-out infinite;
+  opacity: 0.85;
+}
+
+.voice-meter--live .voice-meter__bar {
+  animation-duration: 0.48s;
+  background: linear-gradient(180deg, #ffb4b4 0%, #e85555 50%, #a83232 100%);
+}
+
+@keyframes voice-meter-bar {
+  0%,
+  100% {
+    transform: scaleY(0.22);
+    opacity: 0.45;
+  }
+  50% {
+    transform: scaleY(1);
+    opacity: 1;
+  }
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  padding: 0.55rem 1rem;
+  background: #1e2633;
+  color: var(--text);
+  transition:
+    background 0.15s,
+    border-color 0.15s;
+}
+
+button:hover:not(:disabled) {
+  background: #252e3d;
+  border-color: #3a4a62;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: linear-gradient(165deg, var(--accent) 0%, var(--accent-dim) 100%);
+  border-color: #6a9dff55;
+  font-weight: 600;
+}
+
+button.primary.active {
+  background: #3d2228;
+  border-color: #ff6b6b88;
+  color: #ffb4b4;
+  box-shadow: 0 0 0 1px #ff6b6b33 inset;
+}
+
+.messages {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 0.85rem 1.25rem 1.25rem;
+  -webkit-overflow-scrolling: touch;
+}
+
+.bubble {
+  padding: 0.65rem 0.85rem;
+  border-radius: 10px;
+  font-size: 0.92rem;
+  max-width: 100%;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.bubble.you {
+  align-self: flex-end;
+  background: #243044;
+  border: 1px solid #354560;
+}
+
+.bubble.awa {
+  align-self: flex-start;
+  background: #1a2330;
+  border: 1px solid var(--border);
+}
+
+.bubble.meta {
+  align-self: center;
+  font-size: 0.8rem;
+  color: var(--muted);
+  background: transparent;
+  border: none;
+}
+
+.bubble-awa-row {
+  align-self: flex-start;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  max-width: 100%;
+}
+
+.bubble-awa-row__replay {
+  align-self: flex-start;
+  font-size: 0.72rem;
+  padding: 0.25rem 0.5rem;
+}
+
+.raw-trace {
+  flex-shrink: 0;
+  margin: 0 1.25rem 0.75rem;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: #0f1218;
+  max-height: 180px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.raw-trace summary {
+  cursor: pointer;
+  padding: 0.45rem 0.65rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+  list-style: none;
+}
+
+.raw-trace summary::-webkit-details-marker {
+  display: none;
+}
+
+.raw-trace__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.5rem 1rem;
+  padding: 0.35rem 0.65rem 0.5rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.raw-trace__log {
+  margin: 0;
+  padding: 0.4rem 0.65rem 0.65rem;
+  overflow-y: auto;
+  max-height: 120px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.68rem;
+  line-height: 1.45;
+  color: #b8c4d6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.raw-trace__line {
+  margin: 0 0 0.25rem;
+}
+
+.raw-trace__line time {
+  color: #6b7a90;
+  margin-right: 0.35rem;
+}
+
+.raw-trace__code {
+  font-size: 0.68em;
+  color: #9aa8bc;
+}

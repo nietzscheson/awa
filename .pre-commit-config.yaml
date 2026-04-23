@@ -18,11 +18,35 @@ repos:
         args: [--config=core/pyproject.toml, --all]
 
       - id: test
-        name: Run tests
+        name: pytest (core)
         entry: uv run --directory core python -m pytest -x
         language: system
         pass_filenames: false
         always_run: true
+        stages: [pre-commit]
+
+      - id: tsc-web
+        name: TypeScript (web)
+        entry: npm exec --prefix web/packages/app -- tsc --noEmit -p web/packages/app
+        language: system
+        pass_filenames: false
+        files: ^web/packages/app/
+        stages: [pre-commit]
+
+      - id: next-lint-web
+        name: next lint (web)
+        entry: npm run lint --prefix web/packages/app
+        language: system
+        pass_filenames: false
+        files: ^web/packages/app/
+        stages: [pre-commit]
+
+      - id: jest-web
+        name: jest (web)
+        entry: npm test --prefix web/packages/app
+        language: system
+        pass_filenames: false
+        files: ^web/packages/app/
         stages: [pre-commit]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit

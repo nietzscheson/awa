@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import json
 import os
 import re
 import unicodedata
@@ -14,6 +15,7 @@ from authlib.deprecate import AuthlibDeprecationWarning
 from dependency_injector import containers, providers
 from dependency_injector.wiring import Provide, inject
 from fastapi import APIRouter, Depends, FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -67,6 +69,25 @@ class UserTypeProfession(StrEnum):
 
 _EMPLOYMENT_TYPE_ENUM_DOC = ", ".join(m.value for m in UserTypeProfession)
 
+# Voice web client sends this as the first ``/chat`` body so the model speaks first (no user hello).
+VOICE_SESSION_OPENING_SIGNAL = "__AWA_VOICE_SESSION_OPENING__"
+
+
+def _sse_data(payload: dict[str, Any]) -> bytes:
+    """One Server-Sent Events frame (UTF-8 JSON in ``data:``)."""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+
+
+def _event_mentions_close_conversation(event: Event) -> bool:
+    """True if this ADK event carries a ``close_conversation`` tool call or response."""
+    for fc in event.get_function_calls():
+        if getattr(fc, "name", None) == "close_conversation":
+            return True
+    for fr in event.get_function_responses():
+        if getattr(fr, "name", None) == "close_conversation":
+            return True
+    return False
+
 
 class CreateSessionRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -80,6 +101,14 @@ class CreateSessionRequest(BaseModel):
 class CreateSessionResponse(BaseModel):
     session_id: str
     user_id: str
+
+
+class AdkSessionListItem(BaseModel):
+    """Summary row for ``GET /sessions`` (ADK-backed sessions for one user)."""
+
+    session_id: str
+    user_id: str
+    last_update_time: float = 0.0
 
 
 class ChatMessagePart(BaseModel):
@@ -143,6 +172,22 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str | None = Field(
         default=None,
         description="Alternate env var for the Gemini API key; GOOGLE_API_KEY wins if both are set.",
+    )
+    ELEVENLABS_API_KEY: str | None = Field(
+        default=None,
+        description="ElevenLabs API key",
+    )
+    OPENAI_API_KEY: str | None = Field(
+        default=None,
+        description="OpenAI API key",
+    )
+    ELEVENLABS_TTS_VOICE_ID: str | None = Field(
+        default=None,
+        description="ElevenLabs TTS voice ID",
+    )
+    ELEVENLABS_TTS_MODEL: str | None = Field(
+        default=None,
+        description="ElevenLabs TTS model",
     )
 
 
@@ -1109,9 +1154,7 @@ DEFAULT_INTERVIEW_QUESTIONNAIRE = InterviewQuestionnaire(
     question_list=[
         InterviewQuestion(
             question_identifier="full_name",
-            question_text=(
-                "Please confirm your full legal name as it should appear on official records."
-            ),
+            question_text="Please confirm your full legal name.",
             question_type=InterviewQuestionType.TEXT,
         ),
         InterviewQuestion(
@@ -1157,6 +1200,27 @@ def build_interview_tool_functions(engine: InterviewEngine) -> list[Any]:
         """Export the interview answers collected so far."""
         return engine.export_answers(user_id, session_id)
 
+    def close_conversation(user_id: str, session_id: str) -> dict[str, Any]:
+        """Mark this turn as finished so voice clients may hang up after TTS.
+
+        Call **exactly once** per hang-up, after:
+
+        - the structured interview is done (``export_interview_answers`` shows
+          ``interview_is_complete``) **and** you have spoken your short thank-you; **or**
+        - the user sends only a brief thanks or goodbye (e.g. gracias, gràcies, thanks) **after**
+          completion—reply with one warm line, **without** saying the interview was \"already\"
+          complete or \"had already finished\", then call this tool.
+
+        Do **not** call before ``submit_interview_answer`` has stored the final step. This tool
+        does not write interview answers; it only signals clients.
+        """
+        return {
+            "ok": True,
+            "closed": True,
+            "user_id": user_id,
+            "session_id": session_id,
+        }
+
     def record_identified_employment_type(
         user_id: str, session_id: str, employment_type: str
     ) -> dict[str, Any]:
@@ -1182,6 +1246,7 @@ def build_interview_tool_functions(engine: InterviewEngine) -> list[Any]:
         record_identified_employment_type,
         reset_interview,
         export_interview_answers,
+        close_conversation,
     ]
 
 
@@ -1221,6 +1286,22 @@ class AwaApiService:
 
     def health(self) -> dict[str, str]:
         return {"message": "healthy"}
+
+    async def list_adk_sessions(self, user_id: str) -> list[AdkSessionListItem]:
+        listed = await self._session_service.list_sessions(
+            app_name=self._runner.app_name,
+            user_id=user_id,
+        )
+        rows = [
+            AdkSessionListItem(
+                session_id=s.id,
+                user_id=s.user_id,
+                last_update_time=float(s.last_update_time or 0.0),
+            )
+            for s in listed.sessions
+        ]
+        rows.sort(key=lambda r: r.last_update_time, reverse=True)
+        return rows
 
     async def create_session(self, body: CreateSessionRequest) -> CreateSessionResponse:
         state = dict(body.metadata)
@@ -1312,13 +1393,39 @@ class AwaApiService:
         )
         await self._session_service.append_event(session, sync_event)
 
-    async def _run_turn_text(
+    async def _prepare_user_content_for_turn(
         self,
         *,
         user_id: str,
         session_id: str,
         user_text: str,
-    ) -> str:
+    ) -> types.Content:
+        if user_text.strip() == VOICE_SESSION_OPENING_SIGNAL:
+            self._interview_engine.get_current_question(user_id, session_id)
+            interview_block = self._interview_turn_context_block(user_id, session_id)
+            if interview_block:
+                combined_user_text = (
+                    f"{interview_block}\n\n"
+                    "[Voice session start — not the candidate's spoken words.]\n"
+                    "They tapped **Start conversation** on a voice client. Speak first: greet briefly "
+                    "in the session language, explain in one or two sentences that this is a short "
+                    "questionnaire about their full legal name, profession with work context, and "
+                    "years in that profession, then ask the active step in natural "
+                    "language. Do **not** wait for them to say hello. Do **not** call "
+                    "submit_interview_answer on this turn; no answer has been given yet.\n"
+                )
+            else:
+                combined_user_text = (
+                    "[Voice session start — not the candidate's spoken words.]\n"
+                    "They began a voice session. Greet warmly in the session language and explain "
+                    "you are here to help. If there is no active interview question in context, "
+                    "keep the reply short.\n"
+                )
+            return types.Content(
+                role="user",
+                parts=[types.Part(text=combined_user_text)],
+            )
+
         exported_pre = self._interview_engine.export_answers(user_id, session_id)
         if exported_pre.get(
             "interview_is_complete"
@@ -1335,7 +1442,10 @@ class AwaApiService:
                     "[Assistant instruction for this reply only] The interview is complete: "
                     "the user's last message was already stored as the final answer. Do not call "
                     "submit_interview_answer, start_interview, or reset_interview. Thank them "
-                    "warmly in the session language and close briefly. Never tell the user that "
+                    "warmly in the session language and close briefly. Do **not** tell them the "
+                    "interview was 'already complete' or 'had already finished'—treat this as the "
+                    "normal successful ending. After your closing line, call **close_conversation** "
+                    "exactly once (same user_id and session_id). Never tell the user that "
                     "'the system' failed, could not process their reply, or that they should retry "
                     "because of a technical or internal error.\n\n"
                     f"Their last answer (already stored): {user_text!r}\n"
@@ -1365,7 +1475,7 @@ class AwaApiService:
                 "with `record_identified_employment_type` from what they said.\n\n"
                 "[Turn guidance] If the user is asking what the job is, what the interview is for, "
                 "or what a question means—rather than answering the active step—do not call "
-                "submit_interview_answer. Explain briefly (this is a structured screening flow; "
+                "submit_interview_answer. Explain briefly (this is a structured questionnaire flow; "
                 "no separate job description unless they provide it), then restate the active "
                 "question in natural language with the same meaning as question_text_verbatim. "
                 'Do not prefix with "la siguiente pregunta" / "the next question is"—ask '
@@ -1376,9 +1486,20 @@ class AwaApiService:
             )
         else:
             combined_user_text = user_text
-        new_message = types.Content(
+        return types.Content(
             role="user",
             parts=[types.Part(text=combined_user_text)],
+        )
+
+    async def _run_turn_text(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        user_text: str,
+    ) -> str:
+        new_message = await self._prepare_user_content_for_turn(
+            user_id=user_id, session_id=session_id, user_text=user_text
         )
         last_final = ""
         async with aclosing(
@@ -1395,6 +1516,95 @@ class AwaApiService:
                         last_final = chunk
         await self._sync_interview_capture_to_session_user_state(user_id, session_id)
         return last_final.strip()
+
+    async def chat_stream(self, body: ChatRequest) -> StreamingResponse:
+        """Stream ADK ``run_async`` model events as SSE (see ADK streaming docs)."""
+        message_text = " ".join(
+            (part.text or "").strip() for part in body.new_message.parts if part.text
+        ).strip()
+        if not message_text:
+            raise HTTPException(
+                status_code=400,
+                detail="new_message.parts must include at least one non-empty text part.",
+            )
+
+        async def sse_events():
+            last_final = ""
+            try:
+                new_message = await self._prepare_user_content_for_turn(
+                    user_id=body.user_id,
+                    session_id=body.session_id,
+                    user_text=message_text,
+                )
+                saw_close_conversation = False
+                async with aclosing(
+                    self._runner.run_async(
+                        user_id=body.user_id,
+                        session_id=body.session_id,
+                        new_message=new_message,
+                    )
+                ) as agen:
+                    async for event in agen:
+                        if _event_mentions_close_conversation(event):
+                            saw_close_conversation = True
+                        role = (
+                            getattr(event.content, "role", None)
+                            if event.content
+                            else None
+                        )
+                        if role == "model":
+                            chunk = self._text_from_event(event)
+                            if chunk:
+                                yield _sse_data(
+                                    {
+                                        "type": "model",
+                                        "text": chunk,
+                                        "partial": bool(event.partial),
+                                    }
+                                )
+                        if event.is_final_response():
+                            final_chunk = self._text_from_event(event)
+                            if final_chunk:
+                                last_final = final_chunk
+                await self._sync_interview_capture_to_session_user_state(
+                    body.user_id, body.session_id
+                )
+                exported = self._interview_engine.export_answers(
+                    body.user_id, body.session_id
+                )
+                yield _sse_data(
+                    {
+                        "type": "done",
+                        "session_id": body.session_id,
+                        "response": last_final.strip(),
+                        "interview_is_complete": bool(
+                            exported.get("interview_is_complete")
+                        ),
+                        "close_conversation": saw_close_conversation,
+                    }
+                )
+            except SessionNotFoundError as exc:
+                yield _sse_data({"type": "error", "code": 404, "message": str(exc)})
+            except ValueError as exc:
+                if "No API key was provided" in str(exc):
+                    yield _sse_data(
+                        {
+                            "type": "error",
+                            "code": 503,
+                            "message": (
+                                "Gemini API key is not configured. Set GOOGLE_API_KEY or "
+                                "GEMINI_API_KEY (https://ai.google.dev/gemini-api/docs/api-key)."
+                            ),
+                        }
+                    )
+                else:
+                    yield _sse_data({"type": "error", "code": 500, "message": str(exc)})
+
+        return StreamingResponse(
+            sse_events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
 
 
 class MainContainer(containers.DeclarativeContainer):
@@ -1462,7 +1672,7 @@ class MainContainer(containers.DeclarativeContainer):
             "When the user instead asks for context—what the interview is for, what the job or "
             "role involves, what a question means, or similar—they are not answering the step yet. "
             "Do **not** call submit_interview_answer for that message. Briefly explain that this "
-            "chat is a short structured screening (name, profession, experience); "
+            "chat is a short structured questionnaire (name, profession, experience); "
             "you do not have a separate detailed job posting unless the user pasted one. Address "
             "their concern in one or two sentences, then kindly restate the **same** active "
             "question (same meaning as question_text_verbatim) so they can answer when ready.\n\n"
@@ -1471,6 +1681,12 @@ class MainContainer(containers.DeclarativeContainer):
             "Call submit_interview_answer only when the user clearly answers the current question; "
             "use reset_interview or export_interview_answers when asked. If validation fails after "
             "submit_interview_answer, explain briefly and repeat the tool's retry guidance.\n\n"
+            "When the questionnaire is finished (or the user only says thanks / goodbye after the "
+            "final step), thank them briefly—**do not** tell them the interview was 'already' "
+            "complete or 'had already finished' unless they explicitly ask about status. After your "
+            "closing line (or a one-line reply to a short thanks), call **close_conversation** exactly "
+            "once so voice clients hang up. If unsure whether the interview is done, call "
+            "export_interview_answers first.\n\n"
             "Profession step (`profession_description`): ask only what question_text_verbatim asks "
             "(their profession or trade)—do not add a second question or category menus. From "
             "their answer, infer whether they are primarily self-employed/freelance, an employee, "
@@ -1481,9 +1697,11 @@ class MainContainer(containers.DeclarativeContainer):
             "after `years_in_profession`; thank the user and close warmly when that step is complete.\n\n"
             "If the user opens with a short greeting after the interview was already finished in this "
             "session, the server may have restarted the questionnaire—follow the new interview turn "
-            "context and confirm their name when that is the active step. Do not claim the interview "
-            "is still complete unless `export_interview_answers` shows interview_is_complete true "
-            "for this turn **before** any restart.\n\n"
+            "context and confirm their name when that is the active step. Use export_interview_answers "
+            "to see current completion state; do not tell the user an interview 'was already closed' "
+            "when you see a fresh active question in context. Do not claim the interview is still "
+            "complete unless `export_interview_answers` shows interview_is_complete true for this turn "
+            "**before** any restart.\n\n"
             "User-facing tone: never tell the user that 'the system', a server, or internal "
             "processing failed, could not handle their message, or that they should try again "
             "because of a vague technical error. Prefer clear, human guidance (including the "
@@ -1536,6 +1754,15 @@ async def create_session(
     return await api.create_session(body)
 
 
+@router.get("/sessions", response_model=list[AdkSessionListItem])
+@inject
+async def list_sessions(
+    user_id: str,
+    api: AwaApiService = Depends(Provide[MainContainer.api_service]),
+):
+    return await api.list_adk_sessions(user_id)
+
+
 @router.post("/chat", response_model=ChatResponse)
 @inject
 async def chat(
@@ -1543,6 +1770,15 @@ async def chat(
     api: AwaApiService = Depends(Provide[MainContainer.api_service]),
 ):
     return await api.chat(body)
+
+
+@router.post("/chat/stream")
+@inject
+async def chat_stream(
+    body: ChatRequest,
+    api: AwaApiService = Depends(Provide[MainContainer.api_service]),
+):
+    return await api.chat_stream(body)
 
 
 @asynccontextmanager
