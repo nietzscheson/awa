@@ -10,7 +10,7 @@ This project uses **[uv](https://docs.astral.sh/uv/)** for Python version pinnin
 
 | Tool | Purpose |
 |------|---------|
-| [Python 3.13+](https://www.python.org/downloads/) | Runtime (`requires-python` in `pyproject.toml`) |
+| [Python 3.13+](https://www.python.org/downloads/) | Runtime (`requires-python` in `core/pyproject.toml`) |
 | [uv](https://docs.astral.sh/uv/getting-started/installation/) | Sync deps, run commands (`uv sync`, `uv run …`) |
 | [Docker](https://docs.docker.com/get-docker/) (optional) | Local Postgres via `compose.yaml` |
 
@@ -18,7 +18,7 @@ This project uses **[uv](https://docs.astral.sh/uv/)** for Python version pinnin
 
 ```bash
 git clone <repository-url>
-cd awa
+cd awa/core
 uv sync --all-groups
 ```
 
@@ -38,29 +38,53 @@ docker compose up -d
 ### Running the API
 
 ```bash
+cd core
 uv run uvicorn src.main:app --host 0.0.0.0 --port 8080 --reload
 ```
 
 Open `http://127.0.0.1:8080/docs` for interactive OpenAPI, or import the Bruno collection under `bruno/awa` (default `baseUrl` is `http://0.0.0.0:8080`; run **Create Session** before **Chat** so random `session_id` / `user_id` line up).
 
+### Voice web UI (Next.js)
+
+The browser client lives in **`web/packages/app`** as a **Next.js** App Router app (not Vite). It uses full-width layout, lists ADK sessions for a stable browser user id, and proxies the FastAPI API plus ElevenLabs STT/TTS.
+
+From the **monorepo root** (`awa/`), ensure the root **`.env`** includes at least `GEMINI_API_KEY` / `GOOGLE_API_KEY`, `ELEVENLABS_API_KEY`, `ELEVENLABS_TTS_VOICE_ID`, and optionally `AWA_API_ORIGIN` (defaults to `http://127.0.0.1:8080`). `next.config.ts` loads that root `.env` so secrets are not duplicated under `web/`.
+
+```bash
+cd web
+npm install
+npm run dev --workspace=@awa/my
+```
+
+Then open **`http://127.0.0.1:5173`** (Next dev server). Keep the FastAPI API running on port **8080** in another terminal (`cd core && uv run uvicorn src.main:app --host 0.0.0.0 --port 8080 --reload`).
+
+| Path | Role |
+|------|------|
+| `web/packages/app/src/app/` | Next.js routes, layout, global CSS |
+| `web/packages/app/src/components/AwaVoiceChat.tsx` | Client voice + session sidebar |
+| `web/packages/app/src/app/api/elevenlabs/*` | Server routes that call ElevenLabs (API key stays server-side) |
+| `web/packages/app/next.config.ts` | Rewrites `/api/awa/*` → `AWA_API_ORIGIN` |
+
 ### Running tests
 
 ```bash
+cd core
 uv run pytest
 ```
 
-Tests use a file-backed SQLite database under `tests/` (see `tests/conftest.py`) and stub the model for the happy-path chat test, so they do not call Gemini or Postgres by default.
+Tests use a file-backed SQLite database under `core/tests/` (see `core/tests/conftest.py`) and stub the model for the happy-path chat test, so they do not call Gemini or Postgres by default.
 
 ### Lint and format
 
 ```bash
+cd core
 uv run ruff check .
 uv run ruff format --check .
 uv run pycln --config pyproject.toml --check --all src tests
 uv run isort src tests --check-only --diff
 ```
 
-Configuration lives in `pyproject.toml` (`[tool.ruff]`, `[tool.isort]`, `[tool.pycln]`).
+Configuration lives in `core/pyproject.toml` (`[tool.ruff]`, `[tool.isort]`, `[tool.pycln]`).
 
 ### GitHub Actions
 
@@ -88,6 +112,8 @@ Hooks mirror CI: **isort** and **pycln** first, then **Ruff** (fix + format), th
 | `DATABASE_URL` | For Postgres sessions | Default matches Docker Compose (`postgresql+psycopg://postgres:postgres@localhost:5432/postgres`). |
 | `GOOGLE_GEMINI_MODEL_NAME` | No | Default `gemini-2.5-flash`. |
 | `ADK_APP_NAME` | No | Default `awa`; must stay consistent between session rows and the ADK `Runner`. |
+| `AWA_API_ORIGIN` | No | Next.js only: base URL for `/api/awa/*` rewrites (default `http://127.0.0.1:8080`). |
+| `NEXT_PUBLIC_ELEVENLABS_STT_MODEL` | No | Next.js client: ElevenLabs STT model id (default `scribe_v1`). |
 
 Optional: root **`.env`** is read by `Settings` (`env_file` in `src/main.py`). Secrets stay out of git (`.env` is ignored; `.env.dist` is committed as a template).
 
@@ -95,10 +121,11 @@ Optional: root **`.env`** is read by `Settings` (`env_file` in `src/main.py`). S
 
 | Path | Role |
 |------|------|
-| `src/main.py` | FastAPI app, DI container, ADK agent/runner, routes |
-| `tests/` | Pytest + `httpx` against the ASGI app |
+| `core/src/main.py` | FastAPI app, DI container, ADK agent/runner, routes |
+| `core/tests/` | Pytest + `httpx` against the ASGI app |
 | `bruno/awa/` | Bruno requests for manual API checks |
 | `compose.yaml` | Local Postgres |
+| `web/packages/app/` | Next.js voice client (`npm run dev --workspace=@awa/my` from `web/`) |
 | `AGENTS.md` | Notes for contributors and AI agents (MVP scope, DI pattern) |
 
 ### VS Code / Cursor
@@ -121,6 +148,4 @@ Many clients cannot use `http://0.0.0.0:8080` as a request URL; switch the Bruno
 
 **Pytest import / settings issues**
 
-`tests/conftest.py` sets `DATABASE_URL` to SQLite **before** importing `src.main` so `Settings` matches the test database; do not import `src.main` earlier in test modules without the same guard.
-# awa
-# awa
+`core/tests/conftest.py` sets `DATABASE_URL` to SQLite **before** importing `src.main` so `Settings` matches the test database; do not import `src.main` earlier in test modules without the same guard.

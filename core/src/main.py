@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import difflib
-import os
+import json
+import logging
 import re
-import unicodedata
 import warnings
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
@@ -14,6 +13,7 @@ from authlib.deprecate import AuthlibDeprecationWarning
 from dependency_injector import containers, providers
 from dependency_injector.wiring import Provide, inject
 from fastapi import APIRouter, Depends, FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,6 +24,28 @@ warnings.filterwarnings(
     category=UserWarning,
     module="google.adk.features._feature_decorator",
 )
+
+
+def _suppress_google_genai_mixed_candidate_parts_warning() -> None:
+    """Drop the SDK warning when ``response.text`` concatenates text alongside tool calls.
+
+    Gemini often returns ``function_call`` parts in the same candidate as assistant text.
+    Using only the text parts is correct for speech/UI; the warning is noisy for agents.
+    """
+
+    class _DropMixedPartsTextWarning(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            if record.levelno != logging.WARNING:
+                return True
+            msg = record.getMessage()
+            return not msg.startswith(
+                "Warning: there are non-text parts in the response:"
+            )
+
+    logging.getLogger("google_genai.types").addFilter(_DropMixedPartsTextWarning())
+
+
+_suppress_google_genai_mixed_candidate_parts_warning()
 
 from google.adk.agents.llm_agent import Agent
 from google.adk.errors.already_exists_error import AlreadyExistsError
@@ -38,6 +60,14 @@ from google.adk.sessions.base_session_service import (
 )
 from google.adk.sessions.state import State
 from google.genai import types
+
+from src.interview_answer_agent import (
+    DeterministicInterviewAnswerNormalizer,
+    InterviewAnswerNormalizer,
+    InterviewNormalizationRejected,
+    build_interview_answer_normalizer,
+    deterministic_parse_interview_response,
+)
 
 
 class SessionLanguage(StrEnum):
@@ -67,6 +97,42 @@ class UserTypeProfession(StrEnum):
 
 _EMPLOYMENT_TYPE_ENUM_DOC = ", ".join(m.value for m in UserTypeProfession)
 
+# Voice web client sends this as the first ``/chat`` body so the model speaks first (no user hello).
+VOICE_SESSION_OPENING_SIGNAL = "__AWA_VOICE_SESSION_OPENING__"
+
+
+def _sse_data(payload: dict[str, Any]) -> bytes:
+    """One Server-Sent Events frame (UTF-8 JSON in ``data:``)."""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+
+
+def _event_is_assistant_speech(event: Event) -> bool:
+    """True for model output events.
+
+    Gemini often omits ``content.role`` on assistant turns; ADK sets ``author`` to the
+    agent name (e.g. ``awa_agent``). Relying only on ``role == \"model\"`` misses
+    those events and breaks streaming / final reply extraction.
+    """
+    if not event.content:
+        return False
+    role = getattr(event.content, "role", None)
+    if role == "user":
+        return False
+    if role == "model":
+        return True
+    return bool(event.author and event.author not in ("user", "awa_api"))
+
+
+def _event_mentions_close_conversation(event: Event) -> bool:
+    """True if this ADK event carries a ``close_conversation`` tool call or response."""
+    for fc in event.get_function_calls():
+        if getattr(fc, "name", None) == "close_conversation":
+            return True
+    for fr in event.get_function_responses():
+        if getattr(fr, "name", None) == "close_conversation":
+            return True
+    return False
+
 
 class CreateSessionRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -80,6 +146,14 @@ class CreateSessionRequest(BaseModel):
 class CreateSessionResponse(BaseModel):
     session_id: str
     user_id: str
+
+
+class AdkSessionListItem(BaseModel):
+    """Summary row for ``GET /sessions`` (ADK-backed sessions for one user)."""
+
+    session_id: str
+    user_id: str
+    last_update_time: float = 0.0
 
 
 class ChatMessagePart(BaseModel):
@@ -144,19 +218,22 @@ class Settings(BaseSettings):
         default=None,
         description="Alternate env var for the Gemini API key; GOOGLE_API_KEY wins if both are set.",
     )
-
-
-def _sync_gemini_api_key_to_environ() -> None:
-    """google-genai reads API keys from os.environ; sync from Settings / .env."""
-    configuration = Settings()
-    if (key := (configuration.GOOGLE_API_KEY or "").strip()) and not (
-        os.environ.get("GOOGLE_API_KEY") or ""
-    ).strip():
-        os.environ["GOOGLE_API_KEY"] = key
-    if (key := (configuration.GEMINI_API_KEY or "").strip()) and not (
-        os.environ.get("GEMINI_API_KEY") or ""
-    ).strip():
-        os.environ["GEMINI_API_KEY"] = key
+    ELEVENLABS_API_KEY: str | None = Field(
+        default=None,
+        description="ElevenLabs API key",
+    )
+    OPENAI_API_KEY: str | None = Field(
+        default=None,
+        description="OpenAI API key",
+    )
+    ELEVENLABS_TTS_VOICE_ID: str | None = Field(
+        default=None,
+        description="ElevenLabs TTS voice ID",
+    )
+    ELEVENLABS_TTS_MODEL: str | None = Field(
+        default=None,
+        description="ElevenLabs TTS model",
+    )
 
 
 # --- Structured interview (LangGraph state machine) -------------------------
@@ -249,267 +326,20 @@ class InterviewQuestion(BaseModel):
         return self
 
 
-_YES_BOOLEAN_PATTERN = re.compile(
-    r"\b(?:yes|yep|yeah|sure|ok|okay|true|affirmative|s[ií]|claro|"
-    r"por\s+supuesto|vale|cierto|afirmativo|correcto)\b",
-    re.IGNORECASE,
-)
-_NO_BOOLEAN_PATTERN = re.compile(
-    r"\b(?:no|nope|nah|false|negative|never|not\s+really|"
-    r"para\s+nada|jam[aá]s|negativo)\b",
-    re.IGNORECASE,
-)
-
-
-def _format_stored_number(value: float) -> str:
-    if value.is_integer():
-        return str(int(value))
-    return str(value).rstrip("0").rstrip(".")
-
-
-def _normalize_cardinal_token(token: str) -> str:
-    lowered = token.lower().strip()
-    return "".join(
-        character
-        for character in unicodedata.normalize("NFD", lowered)
-        if unicodedata.category(character) != "Mn"
-    )
-
-
-def _build_cardinal_word_values() -> dict[str, int]:
-    """Spanish and English number words for typical experience-year answers (0–60)."""
-    pairs: list[tuple[str, int]] = [
-        ("cero", 0),
-        ("zero", 0),
-        ("uno", 1),
-        ("una", 1),
-        ("one", 1),
-        ("dos", 2),
-        ("two", 2),
-        ("tres", 3),
-        ("three", 3),
-        ("cuatro", 4),
-        ("four", 4),
-        ("cinco", 5),
-        ("five", 5),
-        ("seis", 6),
-        ("six", 6),
-        ("siete", 7),
-        ("seven", 7),
-        ("ocho", 8),
-        ("eight", 8),
-        ("nueve", 9),
-        ("nine", 9),
-        ("diez", 10),
-        ("ten", 10),
-        ("once", 11),
-        ("eleven", 11),
-        ("doce", 12),
-        ("twelve", 12),
-        ("trece", 13),
-        ("thirteen", 13),
-        ("catorce", 14),
-        ("fourteen", 14),
-        ("quince", 15),
-        ("fifteen", 15),
-        ("dieciseis", 16),
-        ("sixteen", 16),
-        ("diecisiete", 17),
-        ("seventeen", 17),
-        ("dieciocho", 18),
-        ("eighteen", 18),
-        ("diecinueve", 19),
-        ("nineteen", 19),
-        ("veinte", 20),
-        ("twenty", 20),
-        ("veintiuno", 21),
-        ("twentyone", 21),
-        ("veintidos", 22),
-        ("twentytwo", 22),
-        ("veintitres", 23),
-        ("twentythree", 23),
-        ("veinticuatro", 24),
-        ("twentyfour", 24),
-        ("veinticinco", 25),
-        ("twentyfive", 25),
-        ("veintiseis", 26),
-        ("twentysix", 26),
-        ("veintisiete", 27),
-        ("twentyseven", 27),
-        ("veintiocho", 28),
-        ("twentyeight", 28),
-        ("veintinueve", 29),
-        ("twentynine", 29),
-        ("treinta", 30),
-        ("thirty", 30),
-        ("cuarenta", 40),
-        ("forty", 40),
-        ("cincuenta", 50),
-        ("fifty", 50),
-        ("sesenta", 60),
-        ("sixty", 60),
-    ]
-    units_es = {
-        1: "uno",
-        2: "dos",
-        3: "tres",
-        4: "cuatro",
-        5: "cinco",
-        6: "seis",
-        7: "siete",
-        8: "ocho",
-        9: "nueve",
-    }
-    for tens_word, base in (
-        ("treinta", 30),
-        ("cuarenta", 40),
-        ("cincuenta", 50),
-    ):
-        for digit, unit_word in units_es.items():
-            phrase = f"{tens_word} y {unit_word}"
-            pairs.append((phrase, base + digit))
-    return {_normalize_cardinal_token(word): value for word, value in pairs}
-
-
-_CARDINAL_WORD_VALUES: dict[str, int] = _build_cardinal_word_values()
-
-
-def _parse_number_from_cardinal_words(raw: str) -> float | None:
-    """Parse digits first; otherwise resolve Spanish/English cardinal words and phrases."""
-    cleaned = raw.strip().replace(",", ".")
-    digit_match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
-    if digit_match:
-        return float(digit_match.group(0))
-
-    normalized_tokens = [
-        _normalize_cardinal_token(match) for match in re.findall(r"\w+", cleaned)
-    ]
-    spaced = " ".join(normalized_tokens)
-    collapsed = re.sub(r"\s+", "", spaced)
-
-    best_spaced: tuple[str, int] | None = None
-    for phrase, value in _CARDINAL_WORD_VALUES.items():
-        if " " not in phrase:
-            continue
-        normalized_phrase = " ".join(
-            _normalize_cardinal_token(part) for part in phrase.split()
-        )
-        if normalized_phrase in spaced and (
-            best_spaced is None or len(normalized_phrase) > len(best_spaced[0])
-        ):
-            best_spaced = (normalized_phrase, value)
-    if best_spaced is not None:
-        return float(best_spaced[1])
-
-    best_collapsed: tuple[str, int] | None = None
-    for phrase, value in _CARDINAL_WORD_VALUES.items():
-        if len(phrase) < 3 or " " in phrase:
-            continue
-        if phrase in collapsed and (
-            best_collapsed is None or len(phrase) > len(best_collapsed[0])
-        ):
-            best_collapsed = (phrase, value)
-    if best_collapsed is not None:
-        return float(best_collapsed[1])
-
-    hits: list[int] = []
-    for token in normalized_tokens:
-        if token in _CARDINAL_WORD_VALUES:
-            hits.append(_CARDINAL_WORD_VALUES[token])
-    if len(hits) == 1:
-        return float(hits[0])
-
-    return None
-
-
-def _parse_flexible_number(raw: str) -> float:
-    value = _parse_number_from_cardinal_words(raw)
-    if value is None:
-        raise ValueError("no_numeric_token")
-    return value
-
-
-def _parse_flexible_boolean(raw: str) -> bool:
-    text = raw.strip()
-    if not text:
-        raise ValueError("empty_boolean")
-    yes_hit = _YES_BOOLEAN_PATTERN.search(text) is not None
-    no_hit = _NO_BOOLEAN_PATTERN.search(text) is not None
-    if yes_hit and no_hit:
-        raise ValueError("ambiguous_boolean")
-    if yes_hit:
-        return True
-    if no_hit:
-        return False
-    lowered = text.lower()
-    if lowered in {"yes", "no", "true", "false", "sí", "si"}:
-        return lowered in {"yes", "true", "sí", "si"}
-    raise ValueError("unrecognized_boolean")
-
-
-def _choice_match_flexible(question: InterviewQuestion, raw: str) -> str:
-    lowered_full = raw.lower().strip()
-    if not lowered_full:
-        raise ValueError("empty_choice")
-
-    direct_hits: list[str] = []
-    for option in question.choice_options:
-        canonical = option.lower()
-        if canonical == lowered_full:
-            return canonical
-        if canonical in lowered_full:
-            direct_hits.append(canonical)
-        for label in question.choice_option_labels.get(option, []):
-            if label.lower() in lowered_full:
-                direct_hits.append(canonical)
-    unique_hits = list(dict.fromkeys(direct_hits))
-    if len(unique_hits) == 1:
-        return unique_hits[0]
-    if len(unique_hits) > 1:
-        raise ValueError("ambiguous_choice")
-
-    candidates: list[str] = []
-    canonical_by_candidate: dict[str, str] = {}
-    for option in question.choice_options:
-        canonical = option.lower()
-        candidates.append(canonical)
-        canonical_by_candidate[canonical] = canonical
-        for label in question.choice_option_labels.get(option, []):
-            lowered_label = label.lower()
-            candidates.append(lowered_label)
-            canonical_by_candidate[lowered_label] = canonical
-
-    close = difflib.get_close_matches(lowered_full, candidates, n=1, cutoff=0.72)
-    if close:
-        return canonical_by_candidate[close[0]]
-
-    for token in re.findall(r"\w+", lowered_full):
-        close_token = difflib.get_close_matches(token, candidates, n=1, cutoff=0.82)
-        if close_token:
-            return canonical_by_candidate[close_token[0]]
-
-    raise ValueError("unrecognized_choice")
-
-
 def _soft_parse_failure_assistant_message(question: InterviewQuestion) -> str:
     if question.question_type == InterviewQuestionType.CHOICE:
         return (
-            "No terminé de encajar tu respuesta con un nivel concreto, pero puedes "
-            "decirlo con tus palabras (por ejemplo principiante, intermedio o avanzado, "
-            "o beginner / intermediate / advanced). "
-            f"Seguimos con: {question.question_text}"
+            "Elige una de las opciones indicadas (o su sinónimo exacto si aparece en la lista). "
+            f"{question.question_text}"
         )
     if question.question_type == InterviewQuestionType.NUMBER:
         return (
-            "No encontré un número claro en tu mensaje; puedes usar cifras o palabras "
-            "(por ejemplo 12, quince años, twenty years). "
+            "No encontré un número claro en tu mensaje; incluye cifras "
+            "(por ejemplo 12 o 15 años). "
             f"{question.question_text}"
         )
     if question.question_type == InterviewQuestionType.BOOLEAN:
-        return (
-            "No quedó claro un sí o un no; puedes responder con sí/no, yes/no, "
-            f"claro, etc. {question.question_text}"
-        )
+        return f"Responde con sí o no (o yes/no). {question.question_text}"
     return (
         question.retry_prompt_text or f"Intentemos de nuevo: {question.question_text}"
     )
@@ -518,46 +348,13 @@ def _soft_parse_failure_assistant_message(question: InterviewQuestion) -> str:
 def parse_interview_answer(
     question: InterviewQuestion, raw_user_text: str
 ) -> InterviewQuestionResponse:
-    """Parse free-form user text into a validated InterviewQuestionResponse."""
-    stripped = raw_user_text.strip()
-    if question.answer_required and not stripped:
-        raise ValueError("answer_required")
-
-    if question.question_type == InterviewQuestionType.TEXT:
-        return InterviewQuestionResponse(
-            raw_user_text=stripped, stored_answer_text=stripped
+    """Validate user text into ``InterviewQuestionResponse`` (delegates to deterministic parser)."""
+    return InterviewQuestionResponse.model_validate(
+        deterministic_parse_interview_response(
+            question.model_dump(mode="json"),
+            raw_user_text,
         )
-
-    if question.question_type == InterviewQuestionType.NUMBER:
-        try:
-            value = _parse_flexible_number(stripped)
-        except ValueError as exc:
-            raise ValueError("unrecognized_number") from exc
-        stored = _format_stored_number(value)
-        return InterviewQuestionResponse(
-            raw_user_text=stripped, stored_answer_text=stored
-        )
-
-    if question.question_type == InterviewQuestionType.BOOLEAN:
-        try:
-            is_yes = _parse_flexible_boolean(stripped)
-        except ValueError as exc:
-            raise ValueError("unrecognized_boolean") from exc
-        stored = "yes" if is_yes else "no"
-        return InterviewQuestionResponse(
-            raw_user_text=stripped, stored_answer_text=stored
-        )
-
-    if question.question_type == InterviewQuestionType.CHOICE:
-        try:
-            canonical = _choice_match_flexible(question, stripped)
-        except ValueError as exc:
-            raise ValueError("unrecognized_choice") from exc
-        return InterviewQuestionResponse(
-            raw_user_text=stripped, stored_answer_text=canonical
-        )
-
-    raise ValueError("unsupported_question_type")
+    )
 
 
 class InterviewQuestionnaire(BaseModel):
@@ -702,8 +499,17 @@ def _looks_like_short_conversation_opener(message: str) -> bool:
 class InterviewEngine:
     """Runs validation and advancement through a compiled LangGraph workflow."""
 
-    def __init__(self, questionnaire: InterviewQuestionnaire) -> None:
+    def __init__(
+        self,
+        questionnaire: InterviewQuestionnaire,
+        logger: logging.Logger | None = None,
+        answer_normalizer: InterviewAnswerNormalizer | None = None,
+    ) -> None:
         self._questionnaire = questionnaire
+        self._logger = logger or logging.getLogger(__name__)
+        self._answer_normalizer: InterviewAnswerNormalizer = (
+            answer_normalizer or DeterministicInterviewAnswerNormalizer()
+        )
         self._sessions_by_storage_key: dict[str, InterviewSessionState] = {}
         self._compiled_graph = self._build_graph()
 
@@ -808,8 +614,8 @@ class InterviewEngine:
     ) -> InterviewTurnReply | None:
         """If the active question is numeric or boolean and ``answer_text`` parses, submit it.
 
-        Avoids relying on the model to call ``submit_interview_answer`` for short answers
-        like ``Quince`` or ``sí`` that the backend already accepts.
+        Short-circuits a tool round when the deterministic parser accepts the text (digits for
+        NUMBER; sí/no-style for BOOLEAN). Only active for deterministic normalizers (offline/tests).
         """
         session = self._get_or_create_session(user_id, session_id)
         if session.interview_is_complete:
@@ -825,6 +631,8 @@ class InterviewEngine:
             InterviewQuestionType.NUMBER,
             InterviewQuestionType.BOOLEAN,
         ):
+            return None
+        if not self._answer_normalizer.is_deterministic:
             return None
         try:
             parse_interview_answer(question, answer_text)
@@ -857,7 +665,30 @@ class InterviewEngine:
             "interview_is_done": session.interview_is_complete,
         }
 
+        current_q = self._questionnaire.get_question_by_index(
+            session.current_question_index
+        )
+        current_qid = current_q.question_identifier if current_q else None
+        self._logger.info(
+            "interview_langgraph invoke user_id=%s session_id=%s "
+            "question_identifier=%s answer_len=%s",
+            user_id,
+            session_id,
+            current_qid,
+            len(answer_text),
+        )
+
         result_state = self._compiled_graph.invoke(graph_state)
+
+        self._logger.info(
+            "interview_langgraph done user_id=%s session_id=%s "
+            "reply_accepted=%s interview_done=%s validation_error=%s",
+            user_id,
+            session_id,
+            result_state.get("reply_is_accepted"),
+            result_state.get("interview_is_done"),
+            result_state.get("validation_error_message"),
+        )
 
         current_question = self._questionnaire.get_question_by_index(
             session.current_question_index
@@ -959,6 +790,11 @@ class InterviewEngine:
             index = int(state["current_question_index"])
             question = questionnaire.get_question_by_index(index)
             payload = question.model_dump(mode="json") if question else None
+            self._logger.debug(
+                "interview_langgraph node=load_question index=%s identifier=%s",
+                index,
+                question.question_identifier if question else None,
+            )
             return {"current_question_payload": payload}
 
         def validate_answer(state: InterviewGraphState) -> InterviewGraphState:
@@ -967,6 +803,9 @@ class InterviewEngine:
             answers_snapshot = dict(state.get("answers_by_question_identifier") or {})
 
             if question_payload is None:
+                self._logger.debug(
+                    "interview_langgraph node=validate_answer accepted=False reason=no_payload"
+                )
                 return {
                     "reply_is_accepted": False,
                     "validation_error_message": "No active question found.",
@@ -983,6 +822,11 @@ class InterviewEngine:
                     question.retry_prompt_text
                     or f"Please answer this question: {question.question_text}"
                 )
+                self._logger.debug(
+                    "interview_langgraph node=validate_answer "
+                    "identifier=%s accepted=False reason=required_empty",
+                    question.question_identifier,
+                )
                 return {
                     "reply_is_accepted": False,
                     "validation_error_message": "Answer is required.",
@@ -991,10 +835,33 @@ class InterviewEngine:
                 }
 
             try:
-                parsed = parse_interview_answer(question, answer_text)
+                parsed_dict = self._answer_normalizer.normalize(
+                    question.model_dump(mode="json"),
+                    answer_text,
+                )
+                parsed = InterviewQuestionResponse.model_validate(parsed_dict)
+            except InterviewNormalizationRejected as exc:
+                self._logger.debug(
+                    "interview_langgraph node=validate_answer "
+                    "identifier=%s accepted=False agent_reject=%s",
+                    question.question_identifier,
+                    exc.code,
+                )
+                return {
+                    "reply_is_accepted": False,
+                    "validation_error_message": exc.code,
+                    "assistant_reply_message": exc.user_message,
+                    "structured_answer": None,
+                }
             except ValueError as exc:
                 error_code = str(exc.args[0]) if exc.args else "parse_error"
                 assistant_message = _soft_parse_failure_assistant_message(question)
+                self._logger.debug(
+                    "interview_langgraph node=validate_answer "
+                    "identifier=%s accepted=False parse_error=%s",
+                    question.question_identifier,
+                    error_code,
+                )
                 return {
                     "reply_is_accepted": False,
                     "validation_error_message": error_code,
@@ -1005,6 +872,10 @@ class InterviewEngine:
             updated_answers = dict(answers_snapshot)
             updated_answers[question.question_identifier] = parsed.stored_answer_text
 
+            self._logger.debug(
+                "interview_langgraph node=validate_answer identifier=%s accepted=True",
+                question.question_identifier,
+            )
             return {
                 "reply_is_accepted": True,
                 "validation_error_message": None,
@@ -1015,13 +886,23 @@ class InterviewEngine:
         def route_after_validation(
             state: InterviewGraphState,
         ) -> Literal["advance_question", "retry_question"]:
-            if state.get("reply_is_accepted"):
+            branch = (
+                "advance_question"
+                if state.get("reply_is_accepted")
+                else "retry_question"
+            )
+            self._logger.debug(
+                "interview_langgraph route_after_validation branch=%s", branch
+            )
+            if branch == "advance_question":
                 return "advance_question"
             return "retry_question"
 
         def retry_question(state: InterviewGraphState) -> InterviewGraphState:
+            idx = state["current_question_index"]
+            self._logger.debug("interview_langgraph node=retry_question index=%s", idx)
             return {
-                "next_question_index": state["current_question_index"],
+                "next_question_index": idx,
                 "interview_is_done": False,
             }
 
@@ -1032,10 +913,20 @@ class InterviewEngine:
                 current_index, answers_after
             )
             if following_index is None:
+                self._logger.debug(
+                    "interview_langgraph node=advance_question "
+                    "from_index=%s interview_done=True",
+                    current_index,
+                )
                 return {
                     "interview_is_done": True,
                     "next_question_index": None,
                 }
+            self._logger.debug(
+                "interview_langgraph node=advance_question from_index=%s next_index=%s",
+                current_index,
+                following_index,
+            )
             return {
                 "interview_is_done": False,
                 "next_question_index": following_index,
@@ -1049,21 +940,33 @@ class InterviewEngine:
 
             if not state.get("reply_is_accepted"):
                 if state.get("assistant_reply_message"):
+                    self._logger.debug(
+                        "interview_langgraph node=build_reply mode=rejected_existing_message"
+                    )
                     return state
                 fallback_text = (
                     current_question.retry_prompt_text
                     if current_question
                     else "Please try again."
                 )
+                self._logger.debug(
+                    "interview_langgraph node=build_reply mode=rejected_fallback"
+                )
                 return {"assistant_reply_message": fallback_text}
 
             if state.get("interview_is_done"):
+                self._logger.debug(
+                    "interview_langgraph node=build_reply mode=complete_after_advance"
+                )
                 return {
                     "assistant_reply_message": "Thank you. The interview is complete.",
                 }
 
             next_index = state.get("next_question_index")
             if next_index is None:
+                self._logger.debug(
+                    "interview_langgraph node=build_reply mode=complete_no_next"
+                )
                 return {
                     "assistant_reply_message": "Thank you. The interview is complete.",
                     "interview_is_done": True,
@@ -1072,12 +975,19 @@ class InterviewEngine:
 
             next_question = questionnaire.get_question_by_index(int(next_index))
             if next_question is None:
+                self._logger.debug(
+                    "interview_langgraph node=build_reply mode=complete_missing_question"
+                )
                 return {
                     "assistant_reply_message": "Thank you. The interview is complete.",
                     "interview_is_done": True,
                     "next_question_index": None,
                 }
 
+            self._logger.debug(
+                "interview_langgraph node=build_reply mode=next_question identifier=%s",
+                next_question.question_identifier,
+            )
             return {
                 "assistant_reply_message": next_question.question_text,
             }
@@ -1109,9 +1019,7 @@ DEFAULT_INTERVIEW_QUESTIONNAIRE = InterviewQuestionnaire(
     question_list=[
         InterviewQuestion(
             question_identifier="full_name",
-            question_text=(
-                "Please confirm your full legal name as it should appear on official records."
-            ),
+            question_text="Please confirm your full legal name.",
             question_type=InterviewQuestionType.TEXT,
         ),
         InterviewQuestion(
@@ -1157,6 +1065,27 @@ def build_interview_tool_functions(engine: InterviewEngine) -> list[Any]:
         """Export the interview answers collected so far."""
         return engine.export_answers(user_id, session_id)
 
+    def close_conversation(user_id: str, session_id: str) -> dict[str, Any]:
+        """Mark this turn as finished so voice clients may hang up after TTS.
+
+        Call **exactly once** per hang-up, after:
+
+        - the structured interview is done (``export_interview_answers`` shows
+          ``interview_is_complete``) **and** you have spoken your short thank-you; **or**
+        - the user sends only a brief thanks or goodbye (e.g. gracias, gràcies, thanks) **after**
+          completion—reply with one warm line, **without** saying the interview was \"already\"
+          complete or \"had already finished\", then call this tool.
+
+        Do **not** call before ``submit_interview_answer`` has stored the final step. This tool
+        does not write interview answers; it only signals clients.
+        """
+        return {
+            "ok": True,
+            "closed": True,
+            "user_id": user_id,
+            "session_id": session_id,
+        }
+
     def record_identified_employment_type(
         user_id: str, session_id: str, employment_type: str
     ) -> dict[str, Any]:
@@ -1182,6 +1111,7 @@ def build_interview_tool_functions(engine: InterviewEngine) -> list[Any]:
         record_identified_employment_type,
         reset_interview,
         export_interview_answers,
+        close_conversation,
     ]
 
 
@@ -1221,6 +1151,22 @@ class AwaApiService:
 
     def health(self) -> dict[str, str]:
         return {"message": "healthy"}
+
+    async def list_adk_sessions(self, user_id: str) -> list[AdkSessionListItem]:
+        listed = await self._session_service.list_sessions(
+            app_name=self._runner.app_name,
+            user_id=user_id,
+        )
+        rows = [
+            AdkSessionListItem(
+                session_id=s.id,
+                user_id=s.user_id,
+                last_update_time=float(s.last_update_time or 0.0),
+            )
+            for s in listed.sessions
+        ]
+        rows.sort(key=lambda r: r.last_update_time, reverse=True)
+        return rows
 
     async def create_session(self, body: CreateSessionRequest) -> CreateSessionResponse:
         state = dict(body.metadata)
@@ -1268,9 +1214,25 @@ class AwaApiService:
 
     @staticmethod
     def _text_from_event(event: Event) -> str:
+        """Visible assistant text only (no tool I/O, chain-of-thought, or code blocks)."""
         if not event.content or not event.content.parts:
             return ""
-        return "".join(part.text or "" for part in event.content.parts)
+        pieces: list[str] = []
+        for part in event.content.parts:
+            if getattr(part, "thought", None):
+                continue
+            if (
+                part.function_call
+                or part.function_response
+                or part.tool_call
+                or part.tool_response
+                or part.executable_code
+                or part.code_execution_result
+            ):
+                continue
+            if part.text:
+                pieces.append(part.text)
+        return "".join(pieces)
 
     async def _sync_interview_capture_to_session_user_state(
         self, user_id: str, session_id: str
@@ -1312,13 +1274,39 @@ class AwaApiService:
         )
         await self._session_service.append_event(session, sync_event)
 
-    async def _run_turn_text(
+    async def _prepare_user_content_for_turn(
         self,
         *,
         user_id: str,
         session_id: str,
         user_text: str,
-    ) -> str:
+    ) -> types.Content:
+        if user_text.strip() == VOICE_SESSION_OPENING_SIGNAL:
+            self._interview_engine.get_current_question(user_id, session_id)
+            interview_block = self._interview_turn_context_block(user_id, session_id)
+            if interview_block:
+                combined_user_text = (
+                    f"{interview_block}\n\n"
+                    "[Voice session start — not the candidate's spoken words.]\n"
+                    "They tapped **Start conversation** on a voice client. Speak first: greet briefly "
+                    "in the session language, explain in one or two sentences that this is a short "
+                    "questionnaire about their full legal name, profession with work context, and "
+                    "years in that profession, then ask the active step in natural "
+                    "language. Do **not** wait for them to say hello. Do **not** call "
+                    "submit_interview_answer on this turn; no answer has been given yet.\n"
+                )
+            else:
+                combined_user_text = (
+                    "[Voice session start — not the candidate's spoken words.]\n"
+                    "They began a voice session. Greet warmly in the session language and explain "
+                    "you are here to help. If there is no active interview question in context, "
+                    "keep the reply short.\n"
+                )
+            return types.Content(
+                role="user",
+                parts=[types.Part(text=combined_user_text)],
+            )
+
         exported_pre = self._interview_engine.export_answers(user_id, session_id)
         if exported_pre.get(
             "interview_is_complete"
@@ -1335,7 +1323,10 @@ class AwaApiService:
                     "[Assistant instruction for this reply only] The interview is complete: "
                     "the user's last message was already stored as the final answer. Do not call "
                     "submit_interview_answer, start_interview, or reset_interview. Thank them "
-                    "warmly in the session language and close briefly. Never tell the user that "
+                    "warmly in the session language and close briefly. Do **not** tell them the "
+                    "interview was 'already complete' or 'had already finished'—treat this as the "
+                    "normal successful ending. After your closing line, call **close_conversation** "
+                    "exactly once (same user_id and session_id). Never tell the user that "
                     "'the system' failed, could not process their reply, or that they should retry "
                     "because of a technical or internal error.\n\n"
                     f"Their last answer (already stored): {user_text!r}\n"
@@ -1365,7 +1356,7 @@ class AwaApiService:
                 "with `record_identified_employment_type` from what they said.\n\n"
                 "[Turn guidance] If the user is asking what the job is, what the interview is for, "
                 "or what a question means—rather than answering the active step—do not call "
-                "submit_interview_answer. Explain briefly (this is a structured screening flow; "
+                "submit_interview_answer. Explain briefly (this is a structured questionnaire flow; "
                 "no separate job description unless they provide it), then restate the active "
                 "question in natural language with the same meaning as question_text_verbatim. "
                 'Do not prefix with "la siguiente pregunta" / "the next question is"—ask '
@@ -1376,11 +1367,23 @@ class AwaApiService:
             )
         else:
             combined_user_text = user_text
-        new_message = types.Content(
+        return types.Content(
             role="user",
             parts=[types.Part(text=combined_user_text)],
         )
+
+    async def _run_turn_text(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        user_text: str,
+    ) -> str:
+        new_message = await self._prepare_user_content_for_turn(
+            user_id=user_id, session_id=session_id, user_text=user_text
+        )
         last_final = ""
+        last_model_text = ""
         async with aclosing(
             self._runner.run_async(
                 user_id=user_id,
@@ -1389,16 +1392,119 @@ class AwaApiService:
             )
         ) as agen:
             async for event in agen:
+                if _event_is_assistant_speech(event):
+                    chunk = self._text_from_event(event)
+                    if chunk:
+                        last_model_text = chunk
                 if event.is_final_response():
                     chunk = self._text_from_event(event)
                     if chunk:
                         last_final = chunk
         await self._sync_interview_capture_to_session_user_state(user_id, session_id)
-        return last_final.strip()
+        return (last_model_text or last_final).strip()
+
+    async def chat_stream(self, body: ChatRequest) -> StreamingResponse:
+        """Stream ADK ``run_async`` model events as SSE (see ADK streaming docs)."""
+        message_text = " ".join(
+            (part.text or "").strip() for part in body.new_message.parts if part.text
+        ).strip()
+        if not message_text:
+            raise HTTPException(
+                status_code=400,
+                detail="new_message.parts must include at least one non-empty text part.",
+            )
+
+        async def sse_events():
+            last_final = ""
+            last_model_text = ""
+            try:
+                new_message = await self._prepare_user_content_for_turn(
+                    user_id=body.user_id,
+                    session_id=body.session_id,
+                    user_text=message_text,
+                )
+                saw_close_conversation = False
+                async with aclosing(
+                    self._runner.run_async(
+                        user_id=body.user_id,
+                        session_id=body.session_id,
+                        new_message=new_message,
+                    )
+                ) as agen:
+                    async for event in agen:
+                        if _event_mentions_close_conversation(event):
+                            saw_close_conversation = True
+                        if _event_is_assistant_speech(event):
+                            chunk = self._text_from_event(event)
+                            if chunk:
+                                last_model_text = chunk
+                                yield _sse_data(
+                                    {
+                                        "type": "model",
+                                        "text": chunk,
+                                        "partial": bool(event.partial),
+                                    }
+                                )
+                        if event.is_final_response():
+                            final_chunk = self._text_from_event(event)
+                            if final_chunk:
+                                last_final = final_chunk
+                await self._sync_interview_capture_to_session_user_state(
+                    body.user_id, body.session_id
+                )
+                exported = self._interview_engine.export_answers(
+                    body.user_id, body.session_id
+                )
+                yield _sse_data(
+                    {
+                        "type": "done",
+                        "session_id": body.session_id,
+                        "response": (last_model_text or last_final).strip(),
+                        "interview_is_complete": bool(
+                            exported.get("interview_is_complete")
+                        ),
+                        "close_conversation": saw_close_conversation,
+                    }
+                )
+            except SessionNotFoundError as exc:
+                yield _sse_data({"type": "error", "code": 404, "message": str(exc)})
+            except ValueError as exc:
+                if "No API key was provided" in str(exc):
+                    yield _sse_data(
+                        {
+                            "type": "error",
+                            "code": 503,
+                            "message": (
+                                "Gemini API key is not configured. Set GOOGLE_API_KEY or "
+                                "GEMINI_API_KEY (https://ai.google.dev/gemini-api/docs/api-key)."
+                            ),
+                        }
+                    )
+                else:
+                    yield _sse_data({"type": "error", "code": 500, "message": str(exc)})
+
+        return StreamingResponse(
+            sse_events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+
+def _make_interview_answer_normalizer() -> InterviewAnswerNormalizer:
+    s = Settings()
+    return build_interview_answer_normalizer(
+        gemini_api_key=(s.GOOGLE_API_KEY or s.GEMINI_API_KEY),
+        model_name=s.GOOGLE_GEMINI_MODEL_NAME,
+    )
 
 
 class MainContainer(containers.DeclarativeContainer):
     wiring_config = containers.WiringConfiguration(modules=[__name__])
+
+    logger = providers.Singleton(
+        logging.getLogger,
+        name=__name__,
+    )
 
     settings = providers.Configuration(pydantic_settings=[Settings()])
 
@@ -1407,9 +1513,13 @@ class MainContainer(containers.DeclarativeContainer):
         db_url=settings.DATABASE_URL,
     )
 
+    interview_answer_normalizer = providers.Singleton(_make_interview_answer_normalizer)
+
     interview_engine = providers.Singleton(
         InterviewEngine,
         questionnaire=providers.Object(DEFAULT_INTERVIEW_QUESTIONNAIRE),
+        logger=logger,
+        answer_normalizer=interview_answer_normalizer,
     )
 
     interview_tool_functions = providers.Callable(
@@ -1462,7 +1572,7 @@ class MainContainer(containers.DeclarativeContainer):
             "When the user instead asks for context—what the interview is for, what the job or "
             "role involves, what a question means, or similar—they are not answering the step yet. "
             "Do **not** call submit_interview_answer for that message. Briefly explain that this "
-            "chat is a short structured screening (name, profession, experience); "
+            "chat is a short structured questionnaire (name, profession, experience); "
             "you do not have a separate detailed job posting unless the user pasted one. Address "
             "their concern in one or two sentences, then kindly restate the **same** active "
             "question (same meaning as question_text_verbatim) so they can answer when ready.\n\n"
@@ -1471,6 +1581,12 @@ class MainContainer(containers.DeclarativeContainer):
             "Call submit_interview_answer only when the user clearly answers the current question; "
             "use reset_interview or export_interview_answers when asked. If validation fails after "
             "submit_interview_answer, explain briefly and repeat the tool's retry guidance.\n\n"
+            "When the questionnaire is finished (or the user only says thanks / goodbye after the "
+            "final step), thank them briefly—**do not** tell them the interview was 'already' "
+            "complete or 'had already finished' unless they explicitly ask about status. After your "
+            "closing line (or a one-line reply to a short thanks), call **close_conversation** exactly "
+            "once so voice clients hang up. If unsure whether the interview is done, call "
+            "export_interview_answers first.\n\n"
             "Profession step (`profession_description`): ask only what question_text_verbatim asks "
             "(their profession or trade)—do not add a second question or category menus. From "
             "their answer, infer whether they are primarily self-employed/freelance, an employee, "
@@ -1481,9 +1597,11 @@ class MainContainer(containers.DeclarativeContainer):
             "after `years_in_profession`; thank the user and close warmly when that step is complete.\n\n"
             "If the user opens with a short greeting after the interview was already finished in this "
             "session, the server may have restarted the questionnaire—follow the new interview turn "
-            "context and confirm their name when that is the active step. Do not claim the interview "
-            "is still complete unless `export_interview_answers` shows interview_is_complete true "
-            "for this turn **before** any restart.\n\n"
+            "context and confirm their name when that is the active step. Use export_interview_answers "
+            "to see current completion state; do not tell the user an interview 'was already closed' "
+            "when you see a fresh active question in context. Do not claim the interview is still "
+            "complete unless `export_interview_answers` shows interview_is_complete true for this turn "
+            "**before** any restart.\n\n"
             "User-facing tone: never tell the user that 'the system', a server, or internal "
             "processing failed, could not handle their message, or that they should try again "
             "because of a vague technical error. Prefer clear, human guidance (including the "
@@ -1536,6 +1654,15 @@ async def create_session(
     return await api.create_session(body)
 
 
+@router.get("/sessions", response_model=list[AdkSessionListItem])
+@inject
+async def list_sessions(
+    user_id: str,
+    api: AwaApiService = Depends(Provide[MainContainer.api_service]),
+):
+    return await api.list_adk_sessions(user_id)
+
+
 @router.post("/chat", response_model=ChatResponse)
 @inject
 async def chat(
@@ -1545,9 +1672,17 @@ async def chat(
     return await api.chat(body)
 
 
+@router.post("/chat/stream")
+@inject
+async def chat_stream(
+    body: ChatRequest,
+    api: AwaApiService = Depends(Provide[MainContainer.api_service]),
+):
+    return await api.chat_stream(body)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _sync_gemini_api_key_to_environ()
     container = MainContainer()
     app.container = container
     container.wire()

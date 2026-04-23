@@ -7,6 +7,9 @@ from pathlib import Path
 
 _test_sqlite = Path(__file__).resolve().parent / ".test_adk.sqlite"
 os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{_test_sqlite}"
+# Interview normalization uses deterministic parsers in tests (no live Gemini calls).
+os.environ.pop("GOOGLE_API_KEY", None)
+os.environ.pop("GEMINI_API_KEY", None)
 
 import pytest
 import pytest_asyncio

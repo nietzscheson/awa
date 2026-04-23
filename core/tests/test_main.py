@@ -74,6 +74,31 @@ async def test_create_session_conflict(http_client: AsyncClient):
     assert second.status_code == 409
 
 
+async def test_list_sessions_returns_rows_for_user(http_client: AsyncClient):
+    user_id = f"u-{uuid.uuid4().hex}"
+    session_a = f"s-{uuid.uuid4().hex}"
+    session_b = f"s-{uuid.uuid4().hex}"
+    other_user = f"u-{uuid.uuid4().hex}"
+    other_session = f"s-{uuid.uuid4().hex}"
+    for sid, uid in (
+        (session_a, user_id),
+        (session_b, user_id),
+        (other_session, other_user),
+    ):
+        r = await http_client.post(
+            "/sessions",
+            json={"session_id": sid, "user_id": uid, "language": "es-MX"},
+        )
+        assert r.status_code == 200
+    listed = await http_client.get("/sessions", params={"user_id": user_id})
+    assert listed.status_code == 200
+    data = listed.json()
+    assert isinstance(data, list)
+    ids = {row["session_id"] for row in data}
+    assert session_a in ids and session_b in ids
+    assert other_session not in ids
+
+
 async def test_chat_requires_nonempty_text(http_client: AsyncClient):
     session_id = f"s-{uuid.uuid4().hex}"
     user_id = f"u-{uuid.uuid4().hex}"
@@ -86,6 +111,18 @@ async def test_chat_requires_nonempty_text(http_client: AsyncClient):
         json={
             "user_id": user_id,
             "session_id": session_id,
+            "new_message": {"parts": [{"text": "   "}]},
+        },
+    )
+    assert response.status_code == 400
+
+
+async def test_chat_stream_empty_message_returns_400(http_client: AsyncClient):
+    response = await http_client.post(
+        "/chat/stream",
+        json={
+            "user_id": "u-test",
+            "session_id": "s-test",
             "new_message": {"parts": [{"text": "   "}]},
         },
     )
@@ -141,9 +178,7 @@ def test_interview_engine_start_returns_first_question():
     assert reply.reply_accepted is True
     assert reply.interview_is_complete is False
     assert reply.current_question_identifier == "full_name"
-    assert reply.assistant_reply_message == (
-        "Please confirm your full legal name as it should appear on official records."
-    )
+    assert reply.assistant_reply_message == ("Please confirm your full legal name.")
 
 
 def test_interview_engine_start_is_idempotent_for_existing_session():
@@ -194,7 +229,7 @@ def test_interview_engine_validation_rejects_non_numeric_years():
     assert "número" in invalid.assistant_reply_message.lower()
 
 
-def test_parse_interview_choice_accepts_spanish_synonyms_inline():
+def test_parse_interview_choice_accepts_exact_option_or_synonym():
     question = InterviewQuestion(
         question_identifier="level",
         question_text="Level?",
@@ -207,7 +242,7 @@ def test_parse_interview_choice_accepts_spanish_synonyms_inline():
     )
     parsed = parse_interview_answer(question, "  principiante  ")
     assert parsed.stored_answer_text == "beginner"
-    parsed_mid = parse_interview_answer(question, "soy nivel intermedio")
+    parsed_mid = parse_interview_answer(question, "intermedio")
     assert parsed_mid.stored_answer_text == "intermediate"
 
 
@@ -238,21 +273,21 @@ def test_parse_interview_number_extracts_embedded_digit():
     assert parsed.stored_answer_text == "12"
 
 
-def test_parse_interview_number_accepts_spanish_cardinal_words():
+def test_parse_interview_number_accepts_digits_in_spanish_phrase():
     question = DEFAULT_INTERVIEW_QUESTIONNAIRE.get_question_by_identifier(
         "years_in_profession"
     )
     assert question is not None
-    parsed = parse_interview_answer(question, "Quince años")
+    parsed = parse_interview_answer(question, "unos 15 años")
     assert parsed.stored_answer_text == "15"
 
 
-def test_parse_interview_number_accepts_treinta_y_cinco():
+def test_parse_interview_number_extracts_first_digit_run_from_long_phrase():
     question = DEFAULT_INTERVIEW_QUESTIONNAIRE.get_question_by_identifier(
         "years_in_profession"
     )
     assert question is not None
-    parsed = parse_interview_answer(question, "llevo treinta y cinco años")
+    parsed = parse_interview_answer(question, "llevo 35 años en total")
     assert parsed.stored_answer_text == "35"
 
 
@@ -380,7 +415,7 @@ def test_forget_interview_state_clears_ram_progress():
     assert again.current_question_identifier == "full_name"
 
 
-def test_submit_current_if_primitive_parses_accepts_spanish_quince_on_years():
+def test_submit_current_if_primitive_parses_accepts_digit_years():
     engine = InterviewEngine(questionnaire=DEFAULT_INTERVIEW_QUESTIONNAIRE)
     sid = f"s-{uuid.uuid4().hex}"
     engine.start_interview(_INTERVIEW_USER_ID, sid)
@@ -389,7 +424,7 @@ def test_submit_current_if_primitive_parses_accepts_spanish_quince_on_years():
     engine.record_identified_employment_type(
         _INTERVIEW_USER_ID, sid, UserTypeProfession.EMPLOYEE.value
     )
-    auto = engine.submit_current_if_primitive_parses(_INTERVIEW_USER_ID, sid, "Quince")
+    auto = engine.submit_current_if_primitive_parses(_INTERVIEW_USER_ID, sid, "15")
     assert auto is not None
     assert auto.reply_accepted is True
     assert auto.interview_is_complete is True
