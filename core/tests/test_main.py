@@ -74,6 +74,31 @@ async def test_create_session_conflict(http_client: AsyncClient):
     assert second.status_code == 409
 
 
+async def test_list_sessions_returns_rows_for_user(http_client: AsyncClient):
+    user_id = f"u-{uuid.uuid4().hex}"
+    session_a = f"s-{uuid.uuid4().hex}"
+    session_b = f"s-{uuid.uuid4().hex}"
+    other_user = f"u-{uuid.uuid4().hex}"
+    other_session = f"s-{uuid.uuid4().hex}"
+    for sid, uid in (
+        (session_a, user_id),
+        (session_b, user_id),
+        (other_session, other_user),
+    ):
+        r = await http_client.post(
+            "/sessions",
+            json={"session_id": sid, "user_id": uid, "language": "es-MX"},
+        )
+        assert r.status_code == 200
+    listed = await http_client.get("/sessions", params={"user_id": user_id})
+    assert listed.status_code == 200
+    data = listed.json()
+    assert isinstance(data, list)
+    ids = {row["session_id"] for row in data}
+    assert session_a in ids and session_b in ids
+    assert other_session not in ids
+
+
 async def test_chat_requires_nonempty_text(http_client: AsyncClient):
     session_id = f"s-{uuid.uuid4().hex}"
     user_id = f"u-{uuid.uuid4().hex}"
@@ -86,6 +111,18 @@ async def test_chat_requires_nonempty_text(http_client: AsyncClient):
         json={
             "user_id": user_id,
             "session_id": session_id,
+            "new_message": {"parts": [{"text": "   "}]},
+        },
+    )
+    assert response.status_code == 400
+
+
+async def test_chat_stream_empty_message_returns_400(http_client: AsyncClient):
+    response = await http_client.post(
+        "/chat/stream",
+        json={
+            "user_id": "u-test",
+            "session_id": "s-test",
             "new_message": {"parts": [{"text": "   "}]},
         },
     )
@@ -141,9 +178,7 @@ def test_interview_engine_start_returns_first_question():
     assert reply.reply_accepted is True
     assert reply.interview_is_complete is False
     assert reply.current_question_identifier == "full_name"
-    assert reply.assistant_reply_message == (
-        "Please confirm your full legal name as it should appear on official records."
-    )
+    assert reply.assistant_reply_message == ("Please confirm your full legal name.")
 
 
 def test_interview_engine_start_is_idempotent_for_existing_session():
