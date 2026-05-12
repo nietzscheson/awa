@@ -21,13 +21,14 @@ tasks:
 
   isort:
     cmds:
-      - uv run isort
+      - uv run isort --settings-path=pyproject.toml .
     dir: ./core
   pycln:
     cmds:
-      - uv run pycln
+      - uv run pycln --config pyproject.toml --check --all src tests
     dir: ./core
   ruff:
     cmds:
-      - uv run ruff
+      - uv run ruff check .
+      - uv run ruff format --check .
     dir: ./core
