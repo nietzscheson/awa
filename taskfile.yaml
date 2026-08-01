@@ -1,0 +1,286 @@
+version: '3'
+
+# Everything in this repo runs through `task`. Run `task` with no arguments for
+# the full list.
+#
+#   core/  — FastAPI + Google ADK API (uv, port 8080)
+#   web/   — Lerna/Nx monorepo of Next.js apps (npm workspaces)
+#              @awa/my                  packages/app                :5173
+#              @awa/avatar              packages/avatar             :5174
+#              @awa/gemini-live-avatar  packages/gemini-live-avatar :5175
+#              @awa/liveavatar          packages/liveavatar         :5176
+
+dotenv: ['.env']
+
+vars:
+  CORE: ./core
+  WEB: ./web
+  API_HOST: 127.0.0.1
+  # 8000, not the 8080 the README mentions: every web package proxies `/adk/*`
+  # to `ADK_API_ORIGIN`, which defaults to http://localhost:8000. Change both
+  # sides together or the browser reaches a dead upstream.
+  API_PORT: '8000'
+  # Lerna scope for each app. `app` is published as @awa/my, not @awa/app.
+  SCOPE_APP: '@awa/my'
+  SCOPE_AVATAR: '@awa/avatar'
+  SCOPE_GEMINI: '@awa/gemini-live-avatar'
+  SCOPE_LIVEAVATAR: '@awa/liveavatar'
+
+tasks:
+  default:
+    desc: List every available task
+    silent: true
+    cmds:
+      - task --list
+
+  # ── setup ───────────────────────────────────────────────────────────────
+
+  setup:
+    desc: First run — create .env, then install core and web dependencies
+    cmds:
+      - task: env
+      - task: deps
+
+  env:
+    desc: Create .env from .env.dist (never overwrites an existing .env)
+    status:
+      - test -f .env
+    cmds:
+      - cp .env.dist .env
+      - cmd: echo "→ .env created from .env.dist — fill in the API keys before running"
+        silent: true
+
+  deps:
+    desc: Install core (uv) and web (npm) dependencies
+    cmds:
+      - task: deps:core
+      - task: deps:web
+
+  deps:core:
+    desc: uv sync in ./core
+    dir: '{{.CORE}}'
+    cmds:
+      - uv sync
+
+  deps:web:
+    desc: npm install in ./web (npm workspaces — hoists into web/node_modules)
+    dir: '{{.WEB}}'
+    cmds:
+      - npm install
+
+  # ── run ─────────────────────────────────────────────────────────────────
+
+  dev:
+    desc: Full stack — Postgres, the API, and every web app (Ctrl-C stops all)
+    deps: [docker:up]
+    cmds:
+      - task: dev:stack
+
+  dev:stack:
+    internal: true
+    deps: [api, web]
+
+  api:
+    desc: FastAPI + ADK API with reload — http://127.0.0.1:8000
+    dir: '{{.CORE}}'
+    cmds:
+      - uv run uvicorn src.main:app --host {{.API_HOST}} --port {{.API_PORT}} --reload
+
+  web:
+    desc: Every web app in parallel (5173–5176)
+    deps: [web:check]
+    dir: '{{.WEB}}'
+    cmds:
+      - lerna run dev --parallel
+
+  app:
+    desc: '@awa/my — Next dev on :5173'
+    cmds:
+      - task: web:run
+        vars: {SCOPE: '{{.SCOPE_APP}}', SCRIPT: dev}
+
+  avatar:
+    desc: '@awa/avatar — Next dev on :5174'
+    cmds:
+      - task: web:run
+        vars: {SCOPE: '{{.SCOPE_AVATAR}}', SCRIPT: dev}
+
+  gemini:
+    desc: '@awa/gemini-live-avatar — Next dev on :5175'
+    cmds:
+      - task: web:run
+        vars: {SCOPE: '{{.SCOPE_GEMINI}}', SCRIPT: dev}
+
+  liveavatar:
+    desc: '@awa/liveavatar — Next dev on :5176'
+    cmds:
+      - task: web:run
+        vars: {SCOPE: '{{.SCOPE_LIVEAVATAR}}', SCRIPT: dev}
+
+  web:run:
+    desc: 'Run any package script: task web:run SCOPE=@awa/liveavatar SCRIPT=build'
+    deps: [web:check]
+    dir: '{{.WEB}}'
+    requires:
+      vars: [SCOPE, SCRIPT]
+    cmds:
+      - lerna run {{.SCRIPT}} --scope {{.SCOPE}}
+
+  web:serve:
+    desc: Every web app in production mode (`next start`) — needs web:build first
+    deps: [web:check]
+    dir: '{{.WEB}}'
+    cmds:
+      - lerna run start --parallel
+
+  # ── build ───────────────────────────────────────────────────────────────
+
+  build:
+    desc: Build every web app (Nx-cached)
+    cmds:
+      - task: web:build
+
+  web:build:
+    desc: lerna run build across packages/*
+    deps: [web:check]
+    dir: '{{.WEB}}'
+    cmds:
+      - lerna run build
+
+  # ── test ────────────────────────────────────────────────────────────────
+
+  test:
+    desc: Run the core and web test suites
+    cmds:
+      - task: core:test
+      - task: web:test
+
+  core:test:
+    desc: pytest in ./core (stops at first failure)
+    dir: '{{.CORE}}'
+    cmds:
+      - uv run python -m pytest -x
+
+  web:test:
+    desc: jest across every web package
+    deps: [web:check]
+    dir: '{{.WEB}}'
+    cmds:
+      - lerna run test
+
+  # ── lint & format ───────────────────────────────────────────────────────
+
+  lint:
+    desc: Lint core (ruff, pycln, isort) and web (next lint)
+    cmds:
+      - task: core:lint
+      - task: web:lint
+
+  core:lint:
+    desc: ruff + pycln + isort checks in ./core
+    cmds:
+      - task: core:ruff
+      - task: core:pycln
+      - task: core:isort
+
+  core:ruff:
+    desc: ruff check + format check in ./core
+    dir: '{{.CORE}}'
+    cmds:
+      - uv run ruff check .
+      - uv run ruff format --check .
+
+  core:pycln:
+    desc: Report unused imports in ./core
+    dir: '{{.CORE}}'
+    cmds:
+      - uv run pycln --config pyproject.toml --check --all src tests
+
+  core:isort:
+    desc: Sort imports in ./core
+    dir: '{{.CORE}}'
+    cmds:
+      - uv run isort --settings-path=pyproject.toml .
+
+  core:format:
+    desc: Rewrite core files — ruff format, ruff --fix, isort, pycln
+    dir: '{{.CORE}}'
+    cmds:
+      - uv run ruff check --fix .
+      - uv run ruff format .
+      - uv run isort --settings-path=pyproject.toml .
+      - uv run pycln --config pyproject.toml --all src tests
+
+  web:lint:
+    desc: next lint across every web package
+    deps: [web:check]
+    dir: '{{.WEB}}'
+    cmds:
+      - lerna run lint
+
+  # ── docker ──────────────────────────────────────────────────────────────
+
+  docker:up:
+    desc: Start Postgres (compose.yaml) in the background
+    preconditions:
+      - test -f compose.yaml
+    cmds:
+      - docker compose up -d --wait
+
+  docker:down:
+    desc: Stop the compose stack
+    cmds:
+      - docker compose down
+
+  docker:logs:
+    desc: Tail compose logs
+    cmds:
+      - docker compose logs -f
+
+  # ── diagnostics & cleanup ───────────────────────────────────────────────
+
+  web:check:
+    desc: Verify every packages/* directory has a package.json (what lerna ENOENTs on)
+    dir: '{{.WEB}}'
+    silent: true
+    cmds:
+      - |
+        missing=""
+        for dir in packages/*/; do
+          [ -f "$dir/package.json" ] || missing="$missing $dir"
+        done
+        if [ -n "$missing" ]; then
+          echo "✗ no package.json in:$missing"
+          echo "  lerna resolves packages/* from web/lerna.json, so every directory there needs one."
+          exit 1
+        fi
+
+  web:list:
+    desc: List the packages lerna sees
+    dir: '{{.WEB}}'
+    cmds:
+      - lerna list --all
+
+  doctor:
+    desc: Show the versions of every tool this repo needs
+    silent: true
+    cmds:
+      - 'echo "node    $(node --version 2>/dev/null || echo MISSING)"'
+      - 'echo "npm     $(npm --version 2>/dev/null || echo MISSING)"'
+      - 'echo "lerna   $(lerna --version 2>/dev/null || echo MISSING)"'
+      - 'echo "uv      $(uv --version 2>/dev/null || echo MISSING)"'
+      - 'echo "docker  $(docker --version 2>/dev/null || echo MISSING)"'
+      - task: web:check
+      - 'echo "packages/* ✓"'
+
+  clean:
+    desc: Remove Next.js build output and caches (keeps node_modules)
+    dir: '{{.WEB}}'
+    cmds:
+      - rm -rf packages/*/.next packages/*/.swc packages/*/tsconfig.tsbuildinfo .nx/cache
+
+  clean:deps:
+    desc: Remove all node_modules and the core virtualenv
+    cmds:
+      - rm -rf {{.WEB}}/node_modules {{.WEB}}/packages/*/node_modules
+      - rm -rf {{.CORE}}/.venv

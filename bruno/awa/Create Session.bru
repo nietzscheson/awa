@@ -1,0 +1,31 @@
+meta {
+  name: Create Session
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/sessions
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "session_id": "{{sessionId}}",
+    "user_id": "{{userId}}",
+    "language": "es-MX",
+    "metadata": {
+      "user_name": "Emmanuel"
+    }
+  }
+}
+
+script:pre-request {
+  bru.setVar("sessionId", bru.interpolate("{{$randomUUID}}"));
+  bru.setVar("userId", bru.interpolate("{{$randomUUID}}"));
+}

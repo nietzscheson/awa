@@ -1,0 +1,29 @@
+repos:
+  - repo: local
+    hooks:
+      - id: isort
+        name: isort (uv)
+        entry: uv run --project core python -m isort
+        language: system
+        types: [python]
+        pass_filenames: true
+        args: [--settings-path=core/pyproject.toml]
+
+      - id: pycln
+        name: pycln
+        entry: uv run --project core python -m pycln
+        language: system
+        types: [python]
+        pass_filenames: true
+        args: [--config=core/pyproject.toml, --all]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.11
+    hooks:
+      - id: ruff
+        language: system
+        entry: uv run --project core ruff check
+        args: [--fix]
+      - id: ruff-format
+        language: system
+        entry: uv run --project core ruff format

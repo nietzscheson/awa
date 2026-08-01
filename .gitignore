@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Pytest ADK SQLite file (see core/tests/conftest.py)
+**/.test_adk.sqlite
+
+.env
+!.env.dist
+node_modules/
+.nx/
+.next/
+# Throwaway output for `NEXT_DIST_DIR=.next-build next build` (see
+# web/packages/app/next.config.ts): a build must not clobber a live dev server.
+.next-build/
+*.tsbuildinfo
+lerna-debug.log
+npm-debug.log*
+.DS_Store

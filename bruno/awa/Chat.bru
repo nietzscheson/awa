@@ -1,0 +1,34 @@
+meta {
+  name: Chat
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/chat
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "user_id": "{{userId}}",
+    "session_id": "{{sessionId}}",
+    "new_message": {
+      "parts": [
+        {
+          "text": "5"
+        }
+      ]
+    }
+  }
+}
+
+docs {
+  Reuses `sessionId` and `userId` from the last **Create Session** request (run that first).
+  Interview tools use the same `session_id` as this body so progress stays aligned with the ADK session.
+}
